@@ -24,8 +24,8 @@ long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-const char* outTopic = "Rullgardin-1/out"; //change to whatever you would like (needs to be different for every cover)
-const char* inTopic = "Rullgardin-1/in"; //change to whatever you would like (needs to be different for every cover)
+const char* outTopic = "cover-1/out"; //change to whatever you would like (needs to be different for every cover)
+const char* inTopic = "cover-1/in"; //change to whatever you would like (needs to be different for every cover)
 
 int maxPos = 0;
 int minPos = 0;
