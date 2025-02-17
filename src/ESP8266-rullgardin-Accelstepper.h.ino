@@ -1,4 +1,3 @@
-
 #define IDLE_WAIT 1
 #define MOVING_UP 2
 #define MOVING_DOWN 3
@@ -8,242 +7,313 @@
 #include "OneButton.h"
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <AccelStepper.h>
 
-#define SW_ACT_PIN 2  // hook up this pin to VCC
-OneButton ButtonAct(SW_ACT_PIN, 0);
+// Pin definitions
+#define SW_ACT_PIN 2      // Button pin
+#define STEPPER_STEP 13   // Stepper STEP pin
+#define STEPPER_DIR 12    // Stepper DIR pin
+#define ENABLE_PIN 14     // Stepper driver enable pin
+#define RELAY_PIN 16      // Relay control pin
 
+// MQTT Configuration
 const char* ssid = "SSID";
 const char* password = "SSID_PW";
 const char* mqtt_server = "ADDRESS_TO_MQTT_SERVER";
 const char* MQTT_USER = "MQTT_USER";
 const char* MQTT_PASSWORD = "MQTT_PASSWORD";
+const char* outTopic = "cover-1/out";
+const char* inTopic = "cover-1/in";
+const char* STATUS_OPEN = "open";
+const char* STATUS_CLOSED = "closed";
 
+// Button configuration
+OneButton ButtonAct(SW_ACT_PIN, false);  // false = button is pulled up
+
+// Network clients
 WiFiClient espClient;
 PubSubClient client(espClient);
-long lastMsg = 0;
-char msg[50];
-int value = 0;
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_DELAY = 5000; // 5 seconds
 
-const char* outTopic = "cover-1/out"; //change to whatever you would like (needs to be different for every cover)
-const char* inTopic = "cover-1/in"; //change to whatever you would like (needs to be different for every cover)
+// Stepper configuration
+AccelStepper stepper(AccelStepper::DRIVER, STEPPER_STEP, STEPPER_DIR);
+const unsigned long MOTOR_UNLOCK_DELAY = 15; // ms
+const float MAX_SPEED = 8000.0;
+const float NORMAL_ACCELERATION = 8000.0;
+const float ENDSTOP_SPEED = 2000.0;
 
-int maxPos = 0;
-int minPos = 0;
-int set_moving_up = 0;
-int set_moving_down = 0;
-int done_down = 0;
-int done_up = 0;
+// Position tracking
+struct CurtainLimits {
+    int maxPos = 0;
+    int minPos = 0;
+    bool isCalibrated = false;
+} limits;
 
-#include <AccelStepper.h>
-// Define a stepper and the pins it will use
-AccelStepper stepper(AccelStepper::DRIVER, 13, 12); // to stepperdriver. pin 13 to STEP and pin 12 to DIR
-// Enable pin for the stepper driver
-const int enPin = 14; // Pin 14 to stepperdriver Enable pin
-const int relayPin = 16; // when this is low the coils of the stepper motor is shortcircuited and when this is high the steppermotor is connected to the stepperdriver.
+// Calibration state
+struct CalibrationState {
+    bool movingDown = false;
+    bool movingUp = false;
+    bool doneDown = false;
+    bool doneUp = false;
+} calibration;
 
-byte state;
+byte state = IDLE_WAIT;
 
-void setup_wifi() {
+void setupWiFi() {
+    Serial.println();
+    Serial.print("Connecting to WiFi network: ");
+    Serial.println(ssid);
 
-  delay(10);
-  // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+    WiFi.begin(ssid, password);
 
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-
-  if ((char)payload[0] == '0') {
-    moveup();
-    Serial.println("Opening cover");
-    client.publish(outTopic, "open");
-  } else if ((char)payload[0] == '1') {
-    movedown();
-    Serial.println("Closing cover");
-    client.publish(outTopic, "closed");
-  } else if ((char)payload[0] == '2') {
-    movestop();
-    Serial.println("stopped movement");
-    if(stepper.currentPosition() >= maxPos/2){
-    client.publish(outTopic, "closed");
-    } else {client.publish(outTopic, "open");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
     }
-  }
+
+    Serial.println();
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
 }
 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    String clientId = "ESP8266Client-";
-    clientId += String(random(0xffff), HEX);
-    if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-      Serial.println("connected");
-      // Once connected, publish an announcement...
-      client.publish(outTopic, "Rullgardin-1 booted");
-      // ... and resubscribe
-      client.subscribe(inTopic);
+void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.print("] ");
+    
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.println(message);
+
+    if (message == "0") {
+        state = MOVING_UP;
+        Serial.println("Command: Opening cover");
+        client.publish(outTopic, STATUS_OPEN);
+    } 
+    else if (message == "1") {
+        state = MOVING_DOWN;
+        Serial.println("Command: Closing cover");
+        client.publish(outTopic, STATUS_CLOSED);
+    } 
+    else if (message == "2") {
+        state = STOP_AT_CURRENT;
+        Serial.println("Command: Stop movement");
+        publishStatus();
+    }
+}
+
+void reconnectMQTT() {
+    if (!client.connected()) {
+        unsigned long now = millis();
+        if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_DELAY) {
+            lastMqttReconnectAttempt = now;
+            Serial.print("Attempting MQTT connection...");
+            
+            String clientId = "ESP8266Client-";
+            clientId += String(random(0xffff), HEX);
+            
+            if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+                Serial.println("connected");
+                client.publish(outTopic, "Curtain controller online");
+                client.subscribe(inTopic);
+            } else {
+                Serial.print("failed, rc=");
+                Serial.print(client.state());
+                Serial.println(" retry in 5 seconds");
+            }
+        }
+    }
+}
+
+void lockMotor() {
+    digitalWrite(ENABLE_PIN, HIGH);
+    delay(MOTOR_UNLOCK_DELAY);
+    digitalWrite(RELAY_PIN, LOW);
+}
+
+void unlockMotor() {
+    digitalWrite(RELAY_PIN, HIGH);
+    delay(MOTOR_UNLOCK_DELAY);
+    digitalWrite(ENABLE_PIN, LOW);
+}
+
+void publishStatus() {
+    const char* status = (stepper.currentPosition() >= limits.maxPos/2) ? STATUS_CLOSED : STATUS_OPEN;
+    client.publish(outTopic, status);
+}
+
+void buttonDisabled() {
+    // Intentionally empty - used when button should do nothing
+}
+
+void handleIdleState() {
+    if (stepper.distanceToGo() == 0) {
+        lockMotor();
+    }
+    
+    if (stepper.isRunning()) {
+        ButtonAct.attachClick([]() { state = STOP_AT_CURRENT; });
+    } 
+    else if (stepper.currentPosition() == limits.maxPos) {
+        unlockMotor();
+        ButtonAct.attachClick([]() { state = MOVING_UP; });
+    } 
+    else {
+        unlockMotor();
+        ButtonAct.attachClick([]() { state = MOVING_DOWN; });
+    }
+    
+    // Configure double-click behavior
+    if (stepper.currentPosition() == limits.minPos) {
+        ButtonAct.attachDoubleClick(buttonDisabled);
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
+        ButtonAct.attachDoubleClick([]() { state = MOVING_UP; });
     }
-  }
-}
-
-void setup()
-{
-  Serial.begin(115200);
-  stepper.setMaxSpeed(8000.0);
-  stepper.setAcceleration(10000.0);
-//  stepper.moveTo(51200);
-  pinMode(enPin,OUTPUT);
-  pinMode(relayPin,OUTPUT)
-  ButtonAct.setClickTicks(600); //600 default (debounce 60)
-  ButtonAct.setPressTicks(1000); // 1000 default
-  state = IDLE_WAIT;
-  setup_wifi();
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-  Serial.println("Idle, waiting for command");
-}
-void loop()
-{
-  if(state == IDLE_WAIT){
-    if(stepper.distanceToGo() == 0){
-      digitalWrite(enPin,HIGH);
-      delay(15)
-      digitalWrite(relayPin,LOW);
-    }
-    if(stepper.isRunning() == true){
-      ButtonAct.attachClick(movestop);
-    }else if(maxPos == stepper.currentPosition() && stepper.isRunning() == false){
-      digitalWrite(relayPin,HIGH);
-      delay(15)
-      ButtonAct.attachClick(moveup);
-    }else if(stepper.isRunning() == false){
-      digitalWrite(relayPin,HIGH);
-      delay(15)
-      ButtonAct.attachClick(movedown);
-    }
-    if(stepper.currentPosition() == minPos){
-      ButtonAct.attachDoubleClick(buttonDisabled);
-    }else{
-      ButtonAct.attachDoubleClick(moveup);
-    }
-    ButtonAct.attachLongPressStart(setendstop);
-
-    // disable other functions
+    
+    // Configure long-press for calibration
+    ButtonAct.attachLongPressStart([]() {
+        state = SET_ENDSTOPS;
+        calibration = {true, false, false, false};
+    });
+    
+    // Disable other button functions
     ButtonAct.attachDuringLongPress(buttonDisabled);
     ButtonAct.attachLongPressStop(buttonDisabled);
-  }
-  if(state == SET_ENDSTOPS){
-    if(set_moving_down == 1 && stepper.distanceToGo() == 0){
-    digitalWrite(relayPin,HIGH);
-    delay(15)
-    digitalWrite(enPin,LOW);
-    stepper.setMaxSpeed(2000.0);
-    //stepper.setAcceleration(40000.0);
-    stepper.move(1000000);
-    ButtonAct.attachClick(donedown);
-    }else if(set_moving_down == 1 && set_moving_up == 0 && done_down == 1){
+}
+
+void finishDownCalibration() {
     stepper.stop();
-    set_moving_down = 0;
-    maxPos = stepper.currentPosition();
-    Serial.println("Max position is: " + String(maxPos));
-    set_moving_up = 1;
-    }else if(set_moving_up == 1 && set_moving_down == 0 && stepper.distanceToGo() == 0){
-    stepper.setMaxSpeed(2000.0);
-    //stepper.setAcceleration(40000.0);
-    stepper.move(-1000000);
-    ButtonAct.attachClick(doneup);
-    }else if(set_moving_down == 0 && set_moving_up == 1 && done_up == 1){
+    calibration.movingDown = false;
+    limits.maxPos = stepper.currentPosition();
+    Serial.print("Calibration: Max position set to: ");
+    Serial.println(limits.maxPos);
+    calibration.movingUp = true;
+}
+
+void finishUpCalibration() {
     stepper.stop();
-    set_moving_up = 0;
-    minPos = stepper.currentPosition();
-    Serial.println("Min position is: " + String(minPos));
-    stepper.setMaxSpeed(8000.0);
-    stepper.setAcceleration(8000.0);
+    calibration.movingUp = false;
+    limits.minPos = stepper.currentPosition();
+    Serial.print("Calibration: Min position set to: ");
+    Serial.println(limits.minPos);
+    
+    // Reset stepper to normal operation
+    stepper.setMaxSpeed(MAX_SPEED);
+    stepper.setAcceleration(NORMAL_ACCELERATION);
+    
+    limits.isCalibrated = true;
     state = IDLE_WAIT;
-    Serial.println("Idle, waiting for command");
+    Serial.println("Calibration complete, returning to idle");
+}
+
+void handleCalibrationState() {
+    if (calibration.movingDown && stepper.distanceToGo() == 0) {
+        unlockMotor();
+        stepper.setMaxSpeed(ENDSTOP_SPEED);
+        stepper.move(1000000);
+        ButtonAct.attachClick([]() { calibration.doneDown = true; });
     }
+    
+    if (calibration.movingDown && calibration.doneDown) {
+        finishDownCalibration();
+    }
+    
+    if (calibration.movingUp && stepper.distanceToGo() == 0) {
+        stepper.setMaxSpeed(ENDSTOP_SPEED);
+        stepper.move(-1000000);
+        ButtonAct.attachClick([]() { calibration.doneUp = true; });
+    }
+    
+    if (calibration.movingUp && calibration.doneUp) {
+        finishUpCalibration();
+    }
+    
+    // Disable other button functions during calibration
     ButtonAct.attachLongPressStart(buttonDisabled);
     ButtonAct.attachDoubleClick(buttonDisabled);
     ButtonAct.attachDuringLongPress(buttonDisabled);
     ButtonAct.attachLongPressStop(buttonDisabled);
-  }
-  if(state == MOVING_DOWN){
-    if (stepper.distanceToGo() == 0){
-      digitalWrite(enPin,LOW);
-      stepper.moveTo(maxPos);
+}
+
+void handleMovementState() {
+    if (stepper.distanceToGo() == 0) {
+        unlockMotor();
+        if (state == MOVING_UP) {
+            stepper.moveTo(limits.minPos);
+            Serial.println("Moving to minimum position");
+        } else {
+            stepper.moveTo(limits.maxPos);
+            Serial.println("Moving to maximum position");
+        }
+        publishStatus();
+        state = IDLE_WAIT;
+        Serial.println("Movement complete, returning to idle");
     }
-    Serial.println("Moving to maximum position");
-    state = IDLE_WAIT;
-    client.publish(outTopic, "closed");
-    Serial.println("Idle, waiting for command");
-  }
-  if(state == MOVING_UP){
-    if (stepper.distanceToGo() == 0){
-      digitalWrite(enPin,LOW);
-      stepper.moveTo(minPos);
-    }
-    Serial.println("Moving to minimum position");
-    state = IDLE_WAIT;
-    client.publish(outTopic, "open");
-    Serial.println("Idle, waiting for command");
-  }
-  if(state == STOP_AT_CURRENT){
+}
+
+void handleStopState() {
     stepper.stop();
-    Serial.println("Stopping at: " + String(stepper.currentPosition()));
+    Serial.print("Stopping at position: ");
+    Serial.println(stepper.currentPosition());
+    publishStatus();
     state = IDLE_WAIT;
-    if(stepper.currentPosition() >= maxPos/2){
-    client.publish(outTopic, "closed");
-    } else {client.publish(outTopic, "open");
-    Serial.println("Idle, waiting for command");
-  }
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-  ButtonAct.tick();
-  stepper.run();
 }
 
-void moveup() {state = MOVING_UP;}
-void movedown() {state = MOVING_DOWN;}
-void movestop() {state = STOP_AT_CURRENT;}
-void setendstop() {
-  state = SET_ENDSTOPS;
-  set_moving_down = 1;
-  set_moving_up = 0;
+void setup() {
+    Serial.begin(115200);
+    
+    // Initialize pins
+    pinMode(ENABLE_PIN, OUTPUT);
+    pinMode(RELAY_PIN, OUTPUT);
+    
+    // Configure stepper
+    stepper.setMaxSpeed(MAX_SPEED);
+    stepper.setAcceleration(NORMAL_ACCELERATION);
+    
+    // Configure button
+    ButtonAct.setClickTicks(600);    // Debounce time
+    ButtonAct.setPressTicks(1000);   // Long press time
+    
+    // Setup network
+    setupWiFi();
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(handleMQTTMessage);
+    
+    Serial.println("System initialized, waiting for commands");
 }
-void donedown() {done_down = 1;}
-void doneup() {done_up = 1;}
 
-void buttonDisabled()
-{
-  // do nothing
+void loop() {
+    // Handle MQTT connection
+    if (!client.connected()) {
+        reconnectMQTT();
+    }
+    client.loop();
+    
+    // Update button and stepper state
+    ButtonAct.tick();
+    stepper.run();
+    
+    // State machine
+    switch(state) {
+        case IDLE_WAIT:
+            handleIdleState();
+            break;
+            
+        case SET_ENDSTOPS:
+            handleCalibrationState();
+            break;
+            
+        case MOVING_UP:
+        case MOVING_DOWN:
+            handleMovementState();
+            break;
+            
+        case STOP_AT_CURRENT:
+            handleStopState();
+            break;
+    }
 }
